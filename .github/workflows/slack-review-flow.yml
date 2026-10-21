@@ -10,6 +10,17 @@ on:
     types: [opened, reopened, ready_for_review, review_requested, synchronize, closed]
   pull_request_review:
     types: [submitted]
+  # TEMPORARY test trigger, remove after validating the flow.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number
+        required: true
+      step:
+        description: Step to force
+        required: true
+        type: choice
+        options: [alert, cleanup]
 
 permissions:
   contents: read
@@ -18,7 +29,7 @@ permissions:
   statuses: read
 
 concurrency:
-  group: slack-review-flow-${{ github.event.pull_request.number }}
+  group: slack-review-flow-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: false
 
 env:
@@ -39,9 +50,9 @@ jobs:
       EVENT_NAME: ${{ github.event_name }}
       EVENT_ACTION: ${{ github.event.action }}
       REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
       PR_MERGED: ${{ github.event.pull_request.merged }}
-      PR_CREATED_AT: ${{ github.event.pull_request.created_at }}
+      FORCE_STEP: ${{ inputs.step }}
       REQUESTED_TEAM: ${{ github.event.requested_team.slug }}
     steps:
       - name: Run Slack review flow
@@ -117,8 +128,10 @@ jobs:
           }
 
           pr=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          PR_CREATED_AT=$(jq -r .created_at <<<"$pr")
 
           team_requested() {
+            [[ "$FORCE_STEP" == "alert" ]] && return 0
             [[ "$EVENT_ACTION" == "review_requested" && "$REQUESTED_TEAM" == "$REVIEW_TEAM" ]] && return 0
             jq -e --arg team "$REVIEW_TEAM" 'any(.requested_teams[]; .slug == $team)' <<<"$pr" >/dev/null
           }
@@ -243,6 +256,8 @@ jobs:
           }
 
           case "${EVENT_NAME}:${EVENT_ACTION}" in
+            workflow_dispatch:*)
+              if [[ "$FORCE_STEP" == "alert" ]]; then post_alert; else delete_thread; fi ;;
             pull_request:closed)
               if [[ "$PR_MERGED" == "true" ]]; then delete_thread; fi ;;
             pull_request:synchronize|pull_request_review:submitted)
