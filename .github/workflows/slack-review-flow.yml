@@ -1,0 +1,270 @@
+name: Slack Review Flow
+
+# Posts a Slack alert when team-api is requested on a PR, replies in the thread
+# once the PR is approved with green checks, and deletes the bot's thread after
+# the merge. The thread is located through Slack message metadata, so no state
+# is kept on the PR.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, review_requested, synchronize, closed]
+  pull_request_review:
+    types: [submitted]
+  # TEMPORARY test trigger, remove after validating the flow.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number
+        required: true
+      step:
+        description: Step to force
+        required: true
+        type: choice
+        options: [alert, cleanup]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: slack-review-flow-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+env:
+  SLACK_CHANNEL: C0C61KJJ1NW
+  REVIEW_TEAM: team-api
+  # Must match the job name below, so the check wait ignores this workflow.
+  SELF_CHECK_NAME: slack-review-flow
+
+jobs:
+  slack-review-flow:
+    name: slack-review-flow
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_USER_MAP: ${{ vars.SLACK_USER_MAP }}
+      EVENT_NAME: ${{ github.event_name }}
+      EVENT_ACTION: ${{ github.event.action }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+      PR_MERGED: ${{ github.event.pull_request.merged }}
+      FORCE_STEP: ${{ inputs.step }}
+      REQUESTED_TEAM: ${{ github.event.requested_team.slug }}
+    steps:
+      - name: Run Slack review flow
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          if [[ -z "${SLACK_BOT_TOKEN}" ]]; then
+            echo "::warning::SLACK_BOT_TOKEN is not set, skipping"
+            exit 0
+          fi
+
+          slack_post() {
+            local resp
+            resp=$(curl -sS -X POST "https://slack.com/api/$1" \
+              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+              -H "Content-Type: application/json; charset=utf-8" \
+              --data "$2")
+            if [[ "$(jq -r .ok <<<"$resp")" != "true" ]]; then
+              echo "::error::Slack $1 failed: $(jq -r .error <<<"$resp")" >&2
+              return 1
+            fi
+            printf '%s' "$resp"
+          }
+
+          # Read methods only accept form-encoded arguments.
+          slack_get() {
+            local method=$1 resp
+            shift
+            local args=()
+            for kv in "$@"; do args+=(--data-urlencode "$kv"); done
+            resp=$(curl -sS --get "https://slack.com/api/${method}" \
+              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" "${args[@]}")
+            if [[ "$(jq -r .ok <<<"$resp")" != "true" ]]; then
+              echo "::error::Slack ${method} failed: $(jq -r .error <<<"$resp")" >&2
+              return 1
+            fi
+            printf '%s' "$resp"
+          }
+
+          escape_mrkdwn() {
+            jq -Rr 'gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;")' <<<"$1"
+          }
+
+          find_thread_ts() {
+            local oldest cursor="" resp ts
+            oldest=$(( $(date -d "${PR_CREATED_AT}" +%s) - 60 ))
+            while :; do
+              resp=$(slack_get conversations.history "channel=${SLACK_CHANNEL}" \
+                "oldest=${oldest}" "limit=200" "include_all_metadata=true" "cursor=${cursor}")
+              ts=$(jq -r --arg repo "$REPO" --arg pr "$PR_NUMBER" '
+                [.messages[]
+                  | select(.metadata.event_type == "pr_review_alert"
+                      and .metadata.event_payload.repo == $repo
+                      and .metadata.event_payload.pr == $pr)
+                  | .ts][0] // empty' <<<"$resp")
+              if [[ -n "$ts" ]]; then printf '%s' "$ts"; return 0; fi
+              cursor=$(jq -r '.response_metadata.next_cursor // empty' <<<"$resp")
+              [[ -z "$cursor" ]] && return 0
+            done
+          }
+
+          thread_replies() {
+            local cursor="" resp all="[]"
+            while :; do
+              resp=$(slack_get conversations.replies "channel=${SLACK_CHANNEL}" "ts=$1" \
+                "limit=200" "include_all_metadata=true" "cursor=${cursor}")
+              all=$(jq -c --argjson acc "$all" '$acc + .messages' <<<"$resp")
+              cursor=$(jq -r '.response_metadata.next_cursor // empty' <<<"$resp")
+              [[ -z "$cursor" ]] && break
+            done
+            printf '%s' "$all"
+          }
+
+          pr=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          PR_CREATED_AT=$(jq -r .created_at <<<"$pr")
+
+          team_requested() {
+            [[ "$FORCE_STEP" == "alert" ]] && return 0
+            [[ "$EVENT_ACTION" == "review_requested" && "$REQUESTED_TEAM" == "$REVIEW_TEAM" ]] && return 0
+            jq -e --arg team "$REVIEW_TEAM" 'any(.requested_teams[]; .slug == $team)' <<<"$pr" >/dev/null
+          }
+
+          post_alert() {
+            if [[ "$(jq -r .draft <<<"$pr")" == "true" ]] || ! team_requested; then
+              echo "team ${REVIEW_TEAM} not requested on a ready PR, nothing to alert"
+              return 0
+            fi
+            local existing
+            existing=$(find_thread_ts)
+            if [[ -n "$existing" ]]; then
+              echo "alert already posted"
+              return 0
+            fi
+            local title author url text payload
+            title=$(escape_mrkdwn "$(jq -r .title <<<"$pr")")
+            author=$(jq -r .user.login <<<"$pr")
+            url=$(jq -r .html_url <<<"$pr")
+            text="Review requested from *${REVIEW_TEAM}*: <${url}|${REPO}#${PR_NUMBER}> ${title} (author: ${author})"
+            payload=$(jq -n --arg ch "$SLACK_CHANNEL" --arg text "$text" --arg repo "$REPO" --arg pr "$PR_NUMBER" '{
+              channel: $ch, text: $text, unfurl_links: false,
+              metadata: {event_type: "pr_review_alert", event_payload: {repo: $repo, pr: $pr}}
+            }')
+            slack_post chat.postMessage "$payload" >/dev/null
+            echo "alert posted"
+          }
+
+          is_approved() {
+            # Latest non-comment review per reviewer decides, as GitHub does without branch protection.
+            gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/reviews" | jq -s -e '
+              [.[][] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")]
+              | group_by(.user.login) | map(max_by(.submitted_at).state)
+              | (any(. == "APPROVED")) and (all(. != "CHANGES_REQUESTED"))' >/dev/null
+          }
+
+          is_mergeable() {
+            local m
+            for _ in 1 2 3 4 5 6; do
+              m=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq .mergeable)
+              [[ "$m" != "null" ]] && break
+              sleep 5
+            done
+            [[ "$m" == "true" ]]
+          }
+
+          # Prints green, red or pending for the head commit, ignoring this workflow's own check.
+          checks_state() {
+            local runs statuses
+            runs=$(gh api --paginate "repos/${REPO}/commits/$1/check-runs" --jq '.check_runs[]' \
+              | jq -s --arg self "$SELF_CHECK_NAME" '[.[] | select(.name != $self)]')
+            statuses=$(gh api "repos/${REPO}/commits/$1/status" --jq '[.statuses[] | .state]')
+            jq -rn --argjson runs "$runs" --argjson st "$statuses" '
+              if any($runs[]; .status == "completed" and (.conclusion | IN("success","neutral","skipped") | not))
+                 or any($st[]; . == "failure" or . == "error") then "red"
+              elif any($runs[]; .status != "completed") or any($st[]; . == "pending") then "pending"
+              else "green" end'
+          }
+
+          reply_able_to_merge() {
+            local thread_ts sha state replies author mention url payload
+            thread_ts=$(find_thread_ts)
+            if [[ -z "$thread_ts" ]]; then
+              echo "no alert thread for this PR, nothing to reply"
+              return 0
+            fi
+            if [[ "$(jq -r .state <<<"$pr")" != "open" ]] || ! is_approved; then
+              echo "PR not approved yet"
+              return 0
+            fi
+            if ! is_mergeable; then
+              echo "PR has conflicts or mergeability is unknown"
+              return 0
+            fi
+            sha=$(jq -r .head.sha <<<"$pr")
+            replies=$(thread_replies "$thread_ts")
+            if jq -e --arg sha "$sha" 'any(.[]; .metadata.event_type == "pr_able_to_merge"
+                and .metadata.event_payload.sha == $sha)' <<<"$replies" >/dev/null; then
+              echo "able-to-merge reply already posted for ${sha}"
+              return 0
+            fi
+            while :; do
+              state=$(checks_state "$sha")
+              echo "checks on ${sha}: ${state}"
+              [[ "$state" == "pending" ]] || break
+              sleep 20
+            done
+            [[ "$state" == "green" ]] || return 0
+            # A new push during the wait makes this run stale, the run for that push takes over.
+            if [[ "$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq .head.sha)" != "$sha" ]]; then
+              echo "head moved while waiting for checks"
+              return 0
+            fi
+            author=$(jq -r .user.login <<<"$pr")
+            mention=$(jq -r --arg l "$author" '.[$l] // empty' <<<"${SLACK_USER_MAP:-null}")
+            if [[ -n "$mention" ]]; then mention="<@${mention}>"; else mention="@${author}"; fi
+            url=$(jq -r .html_url <<<"$pr")
+            payload=$(jq -n --arg ch "$SLACK_CHANNEL" --arg ts "$thread_ts" --arg sha "$sha" \
+              --arg text "${mention} <${url}|${REPO}#${PR_NUMBER}> is approved with green checks and can be merged." '{
+              channel: $ch, thread_ts: $ts, text: $text, unfurl_links: false,
+              metadata: {event_type: "pr_able_to_merge", event_payload: {sha: $sha}}
+            }')
+            slack_post chat.postMessage "$payload" >/dev/null
+            echo "able-to-merge reply posted"
+          }
+
+          delete_thread() {
+            local thread_ts bot_user replies
+            thread_ts=$(find_thread_ts)
+            if [[ -z "$thread_ts" ]]; then
+              echo "no alert thread for this PR"
+              return 0
+            fi
+            bot_user=$(slack_post auth.test '{}' | jq -r .user_id)
+            replies=$(thread_replies "$thread_ts")
+            # A bot token can only delete its own messages, replies from people are kept.
+            jq -r --arg bot "$bot_user" --arg root "$thread_ts" \
+              '.[] | select(.user == $bot and .ts != $root) | .ts' <<<"$replies" \
+              | while read -r ts; do
+                  slack_post chat.delete "$(jq -n --arg ch "$SLACK_CHANNEL" --arg ts "$ts" '{channel: $ch, ts: $ts}')" >/dev/null
+                done
+            slack_post chat.delete "$(jq -n --arg ch "$SLACK_CHANNEL" --arg ts "$thread_ts" '{channel: $ch, ts: $ts}')" >/dev/null
+            echo "thread deleted"
+          }
+
+          case "${EVENT_NAME}:${EVENT_ACTION}" in
+            workflow_dispatch:*)
+              if [[ "$FORCE_STEP" == "alert" ]]; then post_alert; else delete_thread; fi ;;
+            pull_request:closed)
+              if [[ "$PR_MERGED" == "true" ]]; then delete_thread; fi ;;
+            pull_request:synchronize|pull_request_review:submitted)
+              reply_able_to_merge ;;
+            pull_request:*)
+              post_alert ;;
+          esac
