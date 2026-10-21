@@ -59,6 +59,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
 
           if [[ -z "${SLACK_BOT_TOKEN}" ]]; then
             echo "::warning::SLACK_BOT_TOKEN is not set, skipping"
@@ -72,7 +73,7 @@ jobs:
               -H "Content-Type: application/json; charset=utf-8" \
               --data "$2")
             if [[ "$(jq -r .ok <<<"$resp")" != "true" ]]; then
-              echo "::error::Slack $1 failed: $(jq -r .error <<<"$resp")"
+              echo "::error::Slack $1 failed: $(jq -r .error <<<"$resp")" >&2
               return 1
             fi
             printf '%s' "$resp"
@@ -87,7 +88,7 @@ jobs:
             resp=$(curl -sS --get "https://slack.com/api/${method}" \
               -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" "${args[@]}")
             if [[ "$(jq -r .ok <<<"$resp")" != "true" ]]; then
-              echo "::error::Slack ${method} failed: $(jq -r .error <<<"$resp")"
+              echo "::error::Slack ${method} failed: $(jq -r .error <<<"$resp")" >&2
               return 1
             fi
             printf '%s' "$resp"
@@ -141,7 +142,9 @@ jobs:
               echo "team ${REVIEW_TEAM} not requested on a ready PR, nothing to alert"
               return 0
             fi
-            if [[ -n "$(find_thread_ts)" ]]; then
+            local existing
+            existing=$(find_thread_ts)
+            if [[ -n "$existing" ]]; then
               echo "alert already posted"
               return 0
             fi
