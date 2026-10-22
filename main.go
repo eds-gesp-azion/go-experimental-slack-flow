@@ -39,6 +39,7 @@ var quotes = []quote{
 	{"Make it work, make it right, make it fast.", "Kent Beck"},
 	{"Any fool can write code that a computer can understand. Good programmers write code that humans can understand.", "Martin Fowler"},
 	{"The most dangerous phrase in the language is: we've always done it this way.", "Grace Hopper"},
+	{"Simplicity is prerequisite for reliability.", "Edsger W. Dijkstra"},
 	{"The function of good software is to make the complex appear to be simple.", "Grady Booch"},
 }
 
