@@ -152,7 +152,7 @@ jobs:
             title=$(escape_mrkdwn "$(jq -r .title <<<"$pr")")
             author=$(jq -r .user.login <<<"$pr")
             url=$(jq -r .html_url <<<"$pr")
-            text="Review requested from *${REVIEW_TEAM}*: <${url}|${REPO}#${PR_NUMBER}> ${title} (author: ${author})"
+            text="<!here> Review requested from *${REVIEW_TEAM}*: <${url}|${REPO}#${PR_NUMBER}> ${title} (author: ${author})"
             payload=$(jq -n --arg ch "$SLACK_CHANNEL" --arg text "$text" --arg repo "$REPO" --arg pr "$PR_NUMBER" '{
               channel: $ch, text: $text, unfurl_links: false,
               metadata: {event_type: "pr_review_alert", event_payload: {repo: $repo, pr: $pr}}
