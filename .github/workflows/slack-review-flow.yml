@@ -294,7 +294,7 @@ jobs:
             resp=$(curl -sS -X POST "https://slack.com/api/reactions.add" \
               -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
               -H "Content-Type: application/json; charset=utf-8" \
-              --data "$(jq -n --arg ch "$SLACK_CHANNEL" --arg ts "$thread_ts" '{channel: $ch, timestamp: $ts, name: "merged"}')")
+              --data "$(jq -n --arg ch "$SLACK_CHANNEL" --arg ts "$thread_ts" '{channel: $ch, timestamp: $ts, name: "white_check_mark"}')")
             err=$(jq -r 'if .ok then "" else .error end' <<<"$resp")
             if [[ -n "$err" && "$err" != "already_reacted" ]]; then
               echo "::error::Slack reactions.add failed: ${err}" >&2
