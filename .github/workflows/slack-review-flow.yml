@@ -1,15 +1,18 @@
 name: Slack Review Flow
 
 # Posts a Slack alert when team-api is requested on a PR, replies in the thread
-# once the PR is approved with green checks, and deletes the bot's thread after
-# the merge. The thread is located through Slack message metadata, so no state
-# is kept on the PR.
+# for each review or comment and once the PR is approved with green checks, and
+# marks the thread as merged after the merge. The thread is located through
+# Slack message metadata, so no state is kept on the PR.
 
 on:
   pull_request:
     types: [opened, reopened, ready_for_review, review_requested, synchronize, closed]
   pull_request_review:
     types: [submitted]
+  # Fires for PRs and issues, the job skips issues. Runs from the default branch only.
+  issue_comment:
+    types: [created]
   # TEMPORARY test trigger, remove after validating the flow.
   workflow_dispatch:
     inputs:
@@ -20,7 +23,7 @@ on:
         description: Step to force
         required: true
         type: choice
-        options: [alert, cleanup]
+        options: [alert, merged]
 
 permissions:
   contents: read
@@ -28,8 +31,10 @@ permissions:
   checks: read
   statuses: read
 
+# A group keeps one pending run and cancels older pending ones, so review and
+# comment runs get their own group to never drop a thread reply.
 concurrency:
-  group: slack-review-flow-${{ github.event.pull_request.number || inputs.pr_number }}
+  group: slack-review-flow-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}${{ github.event.review.id && format('-review-{0}', github.event.review.id) || '' }}${{ github.event.comment.id && format('-comment-{0}', github.event.comment.id) || '' }}
   cancel-in-progress: false
 
 env:
@@ -41,6 +46,7 @@ env:
 jobs:
   slack-review-flow:
     name: slack-review-flow
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -50,10 +56,16 @@ jobs:
       EVENT_NAME: ${{ github.event_name }}
       EVENT_ACTION: ${{ github.event.action }}
       REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
       PR_MERGED: ${{ github.event.pull_request.merged }}
       FORCE_STEP: ${{ inputs.step }}
       REQUESTED_TEAM: ${{ github.event.requested_team.slug }}
+      ACTIVITY_USER: ${{ github.event.review.user.login || github.event.comment.user.login }}
+      ACTIVITY_USER_TYPE: ${{ github.event.review.user.type || github.event.comment.user.type }}
+      ACTIVITY_URL: ${{ github.event.review.html_url || github.event.comment.html_url }}
+      ACTIVITY_BODY: ${{ github.event.review.body || github.event.comment.body }}
+      REVIEW_ID: ${{ github.event.review.id }}
+      REVIEW_STATE: ${{ github.event.review.state }}
     steps:
       - name: Run Slack review flow
         shell: bash
@@ -239,31 +251,79 @@ jobs:
             echo "able-to-merge reply posted"
           }
 
-          delete_thread() {
-            local thread_ts bot_user replies
+          reply_activity() {
+            if [[ "$ACTIVITY_USER_TYPE" == "Bot" ]]; then
+              echo "activity by a bot, nothing to reply"
+              return 0
+            fi
+            local thread_ts body verb quote text payload
+            thread_ts=$(find_thread_ts)
+            if [[ -z "$thread_ts" ]]; then
+              echo "no alert thread for this PR, nothing to reply"
+              return 0
+            fi
+            body=$ACTIVITY_BODY
+            # Inline comments come as a review with an empty body.
+            if [[ -n "$REVIEW_ID" && -z "$body" ]]; then
+              body=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews/${REVIEW_ID}/comments" --jq '.[0].body // ""')
+            fi
+            case "$REVIEW_STATE" in
+              approved) verb="approved" ;;
+              changes_requested) verb="requested changes on" ;;
+              *) verb="commented on" ;;
+            esac
+            quote=$(jq -Rrs 'if length > 500 then .[0:500] + "..." else . end
+              | gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;")
+              | rtrimstr("\n") | split("\n") | map("> " + .) | join("\n")' <<<"$body")
+            text="*${ACTIVITY_USER}* ${verb} <${ACTIVITY_URL}|${REPO}#${PR_NUMBER}>"
+            [[ -n "$body" ]] && text+=$'\n'"${quote}"
+            payload=$(jq -n --arg ch "$SLACK_CHANNEL" --arg ts "$thread_ts" --arg text "$text" '{
+              channel: $ch, thread_ts: $ts, text: $text, unfurl_links: false
+            }')
+            slack_post chat.postMessage "$payload" >/dev/null
+            echo "activity reply posted"
+          }
+
+          mark_merged() {
+            local thread_ts resp err replies payload
             thread_ts=$(find_thread_ts)
             if [[ -z "$thread_ts" ]]; then
               echo "no alert thread for this PR"
               return 0
             fi
-            bot_user=$(slack_post auth.test '{}' | jq -r .user_id)
+            resp=$(curl -sS -X POST "https://slack.com/api/reactions.add" \
+              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+              -H "Content-Type: application/json; charset=utf-8" \
+              --data "$(jq -n --arg ch "$SLACK_CHANNEL" --arg ts "$thread_ts" '{channel: $ch, timestamp: $ts, name: "merged"}')")
+            err=$(jq -r 'if .ok then "" else .error end' <<<"$resp")
+            if [[ -n "$err" && "$err" != "already_reacted" ]]; then
+              echo "::error::Slack reactions.add failed: ${err}" >&2
+              return 1
+            fi
             replies=$(thread_replies "$thread_ts")
-            # A bot token can only delete its own messages, replies from people are kept.
-            jq -r --arg bot "$bot_user" --arg root "$thread_ts" \
-              '.[] | select(.user == $bot and .ts != $root) | .ts' <<<"$replies" \
-              | while read -r ts; do
-                  slack_post chat.delete "$(jq -n --arg ch "$SLACK_CHANNEL" --arg ts "$ts" '{channel: $ch, ts: $ts}')" >/dev/null
-                done
-            slack_post chat.delete "$(jq -n --arg ch "$SLACK_CHANNEL" --arg ts "$thread_ts" '{channel: $ch, ts: $ts}')" >/dev/null
-            echo "thread deleted"
+            if jq -e 'any(.[]; .metadata.event_type == "pr_merged")' <<<"$replies" >/dev/null; then
+              echo "merged reply already posted"
+              return 0
+            fi
+            payload=$(jq -n --arg ch "$SLACK_CHANNEL" --arg ts "$thread_ts" --arg pr "$PR_NUMBER" '{
+              channel: $ch, thread_ts: $ts, text: "MERGEADO",
+              metadata: {event_type: "pr_merged", event_payload: {pr: $pr}}
+            }')
+            slack_post chat.postMessage "$payload" >/dev/null
+            echo "thread marked as merged"
           }
 
           case "${EVENT_NAME}:${EVENT_ACTION}" in
             workflow_dispatch:*)
-              if [[ "$FORCE_STEP" == "alert" ]]; then post_alert; else delete_thread; fi ;;
+              if [[ "$FORCE_STEP" == "alert" ]]; then post_alert; else mark_merged; fi ;;
             pull_request:closed)
-              if [[ "$PR_MERGED" == "true" ]]; then delete_thread; fi ;;
-            pull_request:synchronize|pull_request_review:submitted)
+              if [[ "$PR_MERGED" == "true" ]]; then mark_merged; fi ;;
+            issue_comment:created)
+              reply_activity ;;
+            pull_request_review:submitted)
+              reply_activity
+              reply_able_to_merge ;;
+            pull_request:synchronize)
               reply_able_to_merge ;;
             pull_request:*)
               post_alert ;;
