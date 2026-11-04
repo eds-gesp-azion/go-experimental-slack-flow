@@ -306,7 +306,7 @@ jobs:
               return 0
             fi
             payload=$(jq -n --arg ch "$SLACK_CHANNEL" --arg ts "$thread_ts" --arg pr "$PR_NUMBER" '{
-              channel: $ch, thread_ts: $ts, text: "MERGEADO",
+              channel: $ch, thread_ts: $ts, text: "MERGEADO :white_check_mark:",
               metadata: {event_type: "pr_merged", event_payload: {pr: $pr}}
             }')
             slack_post chat.postMessage "$payload" >/dev/null
